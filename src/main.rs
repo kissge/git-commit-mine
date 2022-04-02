@@ -1,11 +1,14 @@
 extern crate sha1;
 #[macro_use]
 extern crate structopt;
+extern crate chrono;
 extern crate num_cpus;
 
+use chrono::prelude::Local;
 use std::cmp;
 use std::cmp::Ordering;
-use std::process::Command;
+use std::io::Write;
+use std::process::{Command, Stdio};
 use std::str;
 use std::sync::mpsc::{channel, Sender};
 use std::thread;
@@ -91,6 +94,16 @@ impl Commit {
         m.update(self.message.as_slice());
 
         return m.digest();
+    }
+
+    fn contents(&self, nonce: u64) -> Vec<u8> {
+        let mut x = self.metadata.clone();
+        x.push(b'\n');
+        x.append(&mut self.prefix.clone());
+        x.append(&mut string_to_vec(&format!(" {0}\n\n", nonce)));
+        x.append(&mut self.message.clone());
+
+        x
     }
 }
 
@@ -191,17 +204,14 @@ committer Gunnar Þór Magnússon <gunnar.magnusson@booking.com> 1526714241 +020
 
         assert_eq!(c.message, string_to_vec("B"));
     }
-
 }
 
 fn count_zeros(hash: std::string::String) -> usize {
-    for (i, c) in hash.chars().enumerate() {
-        if c != '0' {
-            return i;
-        }
+    if hash.chars().zip("1234567".chars()).all(|(a, b)| a == b) {
+        999
+    } else {
+        0
     }
-
-    return hash.len();
 }
 
 #[derive(StructOpt, Debug)]
@@ -299,6 +309,8 @@ fn main() {
                 if local_best.cmp(&b) == Ordering::Less {
                     local_best = b;
                     results.send(b).unwrap();
+                } else if n % 30_000_000 == 0 {
+                    results.send(b).unwrap();
                 }
 
                 n += threads as u64
@@ -311,6 +323,8 @@ fn main() {
         if best.cmp(&b) == Ordering::Less {
             best = b;
             println!("{}", best.string(&opt.prefix));
+        } else {
+            println!("{:?} {}", Local::now(), b.nonce);
         }
 
         if best.zeros >= opt.zeros || start.elapsed() > timeout {
@@ -318,5 +332,32 @@ fn main() {
         }
     }
 
-    println!("Best result: {}", best.string(&opt.prefix));
+    println!(
+        "Best result: {} ({})",
+        best.string(&opt.prefix),
+        c.annotate(best.nonce).to_string()
+    );
+
+    let mut child = Command::new("git")
+        .arg("hash-object")
+        .arg("-t")
+        .arg("commit")
+        .arg("-w")
+        .arg("--stdin")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let child_stdin = child.stdin.as_mut().unwrap();
+    child_stdin.write_all(&c.contents(best.nonce)).unwrap();
+    drop(child_stdin);
+
+    let stdout = child.wait_with_output().unwrap().stdout;
+    let newsha1 = std::str::from_utf8(&stdout).unwrap();
+
+    Command::new("git")
+        .arg("reset")
+        .arg(newsha1.trim())
+        .spawn()
+        .unwrap();
 }
